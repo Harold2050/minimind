@@ -118,6 +118,7 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
         # 如果设了 max_seq_len，从右边截取最后 max_seq_len 个 token(保留最近的)。
         # [:, -n:] 是切片：取最后 n 列。
         if args.max_seq_len:
+            # [:, -n:] 是切片：取最后 n 列(保留最近的 token，丢掉最前面的)。
             prompt_inputs["input_ids"] = prompt_inputs["input_ids"][:, -args.max_seq_len:]
             prompt_inputs["attention_mask"] = prompt_inputs["attention_mask"][:, -args.max_seq_len:]
 
@@ -129,12 +130,15 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
             max_new_tokens=args.max_gen_len,
             temperature=0.8,
         )
-        outputs = rollout_result.output_ids
-        completion_ids = rollout_result.completion_ids
-        completions = rollout_result.completions
-        # 旧策略下每个 token 的 logp(rollout 时记录的)
+        # 从 rollout 结果里解包各种产物(见 rollout_engine.py 的 RolloutResult)：
+        outputs = rollout_result.output_ids                    # 完整序列 prompt+回答
+        completion_ids = rollout_result.completion_ids         # 只含回答部分
+        completions = rollout_result.completions               # 回答的文本(人看的)
+        # 旧策略下每个 token 的 logp(rollout 时记录的，RL 更新要用)
+        # .to(device) 搬到 GPU；.detach() 切断梯度图(这是"旧的"固定值，不参与反传)。
         old_per_token_logps = rollout_result.per_token_logps.to(args.device).detach()
-        prompt_lens = rollout_result.prompt_lens.to(args.device)
+        prompt_lens = rollout_result.prompt_lens.to(args.device)   # 每个 prompt 的长度
+        # full_mask：标记哪些位置不是 pad(1=真实 token, 0=pad)。.long() 转 int64。
         full_mask = (outputs != tokenizer.pad_token_id).long()
         # logp_pos：回答 token 在完整序列的绝对位置(同 PPO)。
         logp_pos = prompt_lens.unsqueeze(1) - 1 + torch.arange(completion_ids.size(1), device=args.device).unsqueeze(0)

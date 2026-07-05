@@ -65,42 +65,48 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
     start_time = time.time()
     last_step = start_step
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
-        input_ids = input_ids.to(args.device)
-        labels = labels.to(args.device)
+        input_ids = input_ids.to(args.device)   # 输入 token id 搬到 GPU
+        labels = labels.to(args.device)         # 标签搬到 GPU
         last_step = step
+        # 动态学习率(余弦退火)；全局进度 = 轮数×每轮步数 + 当前步
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
+        # 把新 lr 写进优化器每组参数的配置里
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
+        # 前向 + 算损失(混合精度上下文)
         with autocast_ctx:
-            res = model(input_ids, labels=labels)
+            res = model(input_ids, labels=labels)   # 模型前向，内部算 logits 和 loss
+            # 总 loss = 主损失 + aux_loss(dense 时为 0)
             loss = res.loss + res.aux_loss
-            loss = loss / args.accumulation_steps
+            loss = loss / args.accumulation_steps   # 梯度累积：缩小 N 倍
 
+        # 反向传播(梯度自动累积到 .grad)
         scaler.scale(loss).backward()
 
+        # 每 accumulation_steps 步更新一次
         if step % args.accumulation_steps == 0:
-            scaler.unscale_(optimizer)
+            scaler.unscale_(optimizer)   # 把放大的梯度缩回真实大小
             # 【LoRA4】梯度裁剪只对 lora_params(基模型参数已冻结，没梯度，裁了也没意义)。
             torch.nn.utils.clip_grad_norm_(lora_params, args.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
+            scaler.step(optimizer)       # 用梯度更新 LoRA 参数
+            scaler.update()              # 更新缩放因子
+            optimizer.zero_grad(set_to_none=True)   # 清空梯度(不清会累加)
 
-        # 打印日志(同前)
+        # ---- 打印日志 ----
         if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
-            current_loss = loss.item() * args.accumulation_steps
+            current_loss = loss.item() * args.accumulation_steps   # .item() 张量转 float
             current_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
-            current_logits_loss = current_loss - current_aux_loss
-            current_lr = optimizer.param_groups[-1]['lr']
-            eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
+            current_logits_loss = current_loss - current_aux_loss   # 纯语言模型损失
+            current_lr = optimizer.param_groups[-1]['lr']           # 当前学习率
+            eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60   # 剩余时间(分钟)
             Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
             if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
 
-        # 定期存权重
+        # ---- 定期存权重(只在主进程) ----
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
-            model.eval()
+            model.eval()   # 切推理模式
             moe_suffix = '_moe' if lm_config.use_moe else ''
             # 【LoRA5】文件名用 lora_name，比如 '../out/lora_medical_768.pth'。
             lora_save_path = f'{args.save_dir}/{args.lora_name}_{lm_config.hidden_size}{moe_suffix}.pth'
@@ -110,11 +116,11 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
             save_lora(model, lora_save_path)
             # 续训包照常存(含优化器状态、进度等)。
             lm_checkpoint(lm_config, weight=args.lora_name, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
-            model.train()
+            model.train()   # 切回训练模式
 
-        del input_ids, labels, res, loss
+        del input_ids, labels, res, loss   # 释放显存
 
-    # 残余梯度处理(同前)
+    # 残余梯度处理：一轮结束若还有没凑够累积步数的梯度，要更新掉
     if last_step > start_step and last_step % args.accumulation_steps != 0:
         scaler.unscale_(optimizer)
         # 【LoRA4】同上，只裁剪 LoRA 参数

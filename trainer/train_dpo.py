@@ -172,33 +172,36 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
             loss = dpo_loss_val + outputs.aux_loss
             loss = loss / args.accumulation_steps
 
+        # 反向传播：算每个参数的梯度(scaler 先放大 loss 防 float16 下溢出)。
         scaler.scale(loss).backward()
 
+        # 每 accumulation_steps 步更新一次参数(梯度累积)
         if step % args.accumulation_steps == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
+            scaler.unscale_(optimizer)   # 梯度缩回真实大小
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)   # 梯度裁剪防爆炸
+            scaler.step(optimizer)       # 用梯度更新参数
+            scaler.update()              # 更新缩放因子
+            optimizer.zero_grad(set_to_none=True)   # 清空梯度(不清会累加)
 
-        # 打印日志
+        # ---- 打印日志 ----
         if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
-            current_loss = loss.item() * args.accumulation_steps
-            current_dpo_loss = dpo_loss_val.item()
-            current_aux_loss = outputs.aux_loss.item()
-            current_lr = optimizer.param_groups[-1]['lr']
-            eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
+            current_loss = loss.item() * args.accumulation_steps       # .item() 张量→float
+            current_dpo_loss = dpo_loss_val.item()                     # DPO 损失(纯偏好部分)
+            current_aux_loss = outputs.aux_loss.item()                 # MoE 辅助损失
+            current_lr = optimizer.param_groups[-1]['lr']              # 当前学习率
+            eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60   # 剩余分钟
 
             Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, dpo_loss: {current_dpo_loss:.4f}, aux_loss: {current_aux_loss:.4f}, learning_rate: {current_lr:.8f}, epoch_time: {eta_min:.3f}min')
 
             if wandb: wandb.log({"loss": current_loss, "dpo_loss": current_dpo_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
 
-        # 定期存权重(同前)
+        # ---- 定期存权重(只在主进程) ----
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
-            model.eval()
+            model.eval()   # 切推理模式(关闭 dropout)
             moe_suffix = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+            # 剥 DDP / compile 包装拿真实模型
             raw_model = model.module if isinstance(model, DistributedDataParallel) else model
             raw_model = getattr(raw_model, '_orig_mod', raw_model)
             state_dict = raw_model.state_dict()

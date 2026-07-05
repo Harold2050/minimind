@@ -162,23 +162,25 @@ def train_epoch(epoch, loader, iters, teacher_model, lm_config_student, start_st
         # alpha 控制 CE 和蒸馏的比重。alpha=1 就是纯 SFT；alpha=0 就是纯蒸馏。
         loss = (alpha * ce_loss + (1 - alpha) * distill_loss) / args.accumulation_steps
 
+        # 反向传播：算梯度(scaler 放大 loss 防 float16 下溢出)。
         scaler.scale(loss).backward()
 
+        # 每 accumulation_steps 步更新一次参数
         if step % args.accumulation_steps == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
+            scaler.unscale_(optimizer)   # 梯度缩回真实大小
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)   # 梯度裁剪
+            scaler.step(optimizer)       # 更新参数
+            scaler.update()              # 更新缩放因子
+            optimizer.zero_grad(set_to_none=True)   # 清空梯度
 
         # 打印日志(多了 ce/distill 两项)
         if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
-            current_loss = loss.item() * args.accumulation_steps
-            current_ce_loss = ce_loss_raw.item()
-            current_aux_loss = res.aux_loss.item() if lm_config_student.use_moe else 0.0
-            current_lr = optimizer.param_groups[-1]['lr']
-            eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
+            current_loss = loss.item() * args.accumulation_steps       # 总损失(还原)
+            current_ce_loss = ce_loss_raw.item()                       # 纯 CE 损失
+            current_aux_loss = res.aux_loss.item() if lm_config_student.use_moe else 0.0   # MoE aux
+            current_lr = optimizer.param_groups[-1]['lr']              # 当前学习率
+            eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60   # 剩余分钟
 
             Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, ce: {current_ce_loss:.4f}, aux_loss: {current_aux_loss:.4f}, distill: {distill_loss.item():.4f}, learning_rate: {current_lr:.8f}, epoch_time: {eta_min:.3f}min')
 
@@ -193,14 +195,16 @@ def train_epoch(epoch, loader, iters, teacher_model, lm_config_student, start_st
                     "epoch_time": eta_min
                 })
 
-        # 定期存权重(同前)
+        # ---- 定期存权重(只在主进程) ----
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
-            model.eval()
+            model.eval()   # 切推理模式
             moe_suffix = '_moe' if lm_config_student.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config_student.hidden_size}{moe_suffix}.pth'
+            # 剥 DDP / compile 包装
             raw_model = model.module if isinstance(model, DistributedDataParallel) else model
             raw_model = getattr(raw_model, '_orig_mod', raw_model)
             state_dict = raw_model.state_dict()
+            # 存半精度 state dict(字典推导式：每个参数 .half().cpu())
             torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
             lm_checkpoint(lm_config_student, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
             model.train()
